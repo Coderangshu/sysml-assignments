@@ -1,0 +1,12 @@
+nanoGPT/.DS_Store
+nanoGPT/.idea
+nanoGPT/.ipynb_checkpoints/
+.vscode
+nanoGPT/__pycache__/
+*.bin
+*.pkl
+*.pt
+*.pyc
+nanoGPT/input.txt
+env/
+venv/
