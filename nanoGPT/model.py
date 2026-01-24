@@ -41,8 +41,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.kv_cache = True
-        self.full_k, self.full_v = None, None
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -51,46 +49,50 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
-        if self.kv_cache and self.full_k is not None:
-            x = x[:,[-1],:]
+    def forward(self, x, use_cache=False, prev_kv_layer=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, new_k, new_v  = self.c_attn(x).split(self.n_embd, dim=2)
-        new_k = new_k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        new_v = new_v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if self.kv_cache:
-            if self.full_k is None:
-                self.full_k = new_k
-                self.full_v = new_v
-            else:
-                self.full_k = torch.cat([self.full_k,new_k],dim=2)
-                self.full_v = torch.cat([self.full_v,new_v],dim=2)
+        if use_cache:
+            # If we have past data, concatenate it (or update buffer in a real optimized implementation)
+            # NOTE: For simple NanoGPT, we can pass k_past/v_past in and cat ONLY ONCE per layer
+            # But the most efficient way for PyTorch is usually returning the new k/v to be managed outside
+            if prev_kv_layer is not None:
+                prev_k, prev_v = prev_kv_layer
+                k = torch.cat((prev_k, k), dim=2)
+                v = torch.cat((prev_v, v), dim=2)
+
+            # Save current kv to return
+            present_kv = (k,v)
+                
         else:
-            self.full_k = new_k
-            self.full_v = new_v
-
+            present_kv = None
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, self.full_k, self.full_v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+
+            # FIX: Only apply causal mask if we are processing a sequence (Prompt Phase).
+            # If q is length 1 (Generation Phase), we want to attend to ALL past keys (no masking).
+            use_causal_mask = (q.size(2) == k.size(2))
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=use_causal_mask)
         else:
             # manual implementation of attention
-            att = (q @ self.full_k.transpose(-2, -1)) * (1.0 / math.sqrt(self.full_k.size(-1)))
-            T_total = self.full_k.size(2)
-            att = att.masked_fill(self.bias[:,:,:T_total,:T_total] == 0, float('-inf'))
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ self.full_v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs) @ -> matmul in pytorch
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs) @ -> matmul in pytorch
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, present_kv
 
 class MLP(nn.Module):
 
@@ -117,11 +119,13 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, prev_kv_layer=None):
+        # Capturing current (k,v) from attention
+        attn_out, kv = self.attn(self.ln_1(x), use_cache=use_cache, prev_kv_layer=prev_kv_layer)
         # x = (B, t, n_embd)
-        x = x + self.attn(self.ln_1(x))
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, kv
 
 @dataclass
 class GPTConfig:
@@ -185,18 +189,32 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, kv_cache=None, targets=None):
         device = idx.device
-        b, t = idx.size()
+        _, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # if previous kv_cache is present
+        if kv_cache is not None:
+            prev_T_length = kv_cache[0][0].size(-2)
+            pos += prev_T_length
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb) # (b, t, n_embd)
-        for block in self.transformer.h:
-            x = block(x)
+
+        new_kv_cache = []
+        for i, block in enumerate(self.transformer.h):
+            kv_layer = kv_cache[i] if kv_cache is not None else None
+            # Using kv cache
+            x, new_kv_layer = block(x, use_cache=True, prev_kv_layer=kv_layer)
+            # not using kv cache
+            # x, new_kv_layer = block(x)
+            if new_kv_layer is not None:
+                new_kv_cache.append(new_kv_layer)
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -208,7 +226,9 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        if len(new_kv_cache)==0:
+            new_kv_cache = None
+        return logits, new_kv_cache, loss
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -329,11 +349,19 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        # Init kv_cache
+        kv_cache = None
+
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # if previous kv_cache is found, only feed the last token
+            if kv_cache is not None:
+                idx_cond = idx[:, -1:] # (B, 1)
+            else:
+                # if the sequence context is longer than context size we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, kv_cache, _ = self(idx_cond, kv_cache=kv_cache)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
