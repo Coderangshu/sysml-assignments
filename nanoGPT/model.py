@@ -41,9 +41,11 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        # KV caching logic ######################################################################################
         self.cache_k = None
         self.cache_v = None
         self.is_caching_enabled = False
+        # -------------------------------------------------------------------------------------------------------
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -61,32 +63,34 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # KV caching logic ######################################################################################
         if self.is_caching_enabled:
-            # If we already have history, append the new token's K/V
-            if self.cache_k is not None and self.cache_v is not None:
-                # 1. Update the internal cache
-                self.cache_k = torch.cat((self.cache_k, k), dim=2)
-                self.cache_v = torch.cat((self.cache_v, v), dim=2)
-                # 2. Use the FULL cache for attention
-                k = self.cache_k
-                v = self.cache_v
-            else:
-                # First run (Prefill): Store the initial sequence
-                self.cache_k = k
-                self.cache_v = v
+            # if not prefill stage (Generation Phase), we append the new keys and values to the cache
+            if self.cache_k is not None:
+                k = torch.cat((self.cache_k, k), dim=2)
+                v = torch.cat((self.cache_v, v), dim=2)
+            self.cache_k = k
+            self.cache_v = v
+        # will be always true if caching is not enables, as all of k and v are calculated in every pass
+        # if True, we are in the Prefill Phase, otherwise we are in the Generation Phase
+        is_prefill_stage = (T==k.size(2)) 
+        # -------------------------------------------------------------------------------------------------------
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
 
-            # FIX: Only apply causal mask if we are processing a sequence (Prompt Phase).
+            # Only apply causal mask if we are processing a sequence (Prefill Phase).
             # If q is length 1 (Generation Phase), we want to attend to ALL past keys (no masking).
-            use_causal_mask = (q.size(2) == k.size(2))
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=use_causal_mask)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_prefill_stage)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # KV caching logic ######################################################################################
+            # apply mask only in prefill stage, in generation stage we want to attend to all past keys (no masking)
+            if is_prefill_stage:
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # -------------------------------------------------------------------------------------------------------
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs) @ -> matmul in pytorch
@@ -190,18 +194,17 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        _, t = idx.size()
+        b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
+        # KV caching logic ######################################################################################
         # Position logic:
         # If caching is ON and we have history, we need offset positions
         # We can check the first layer to see if cache exists
-        first_layer_cache = self.transformer.h[0].attn.cache_k
-        if first_layer_cache is not None:
-            past_length = first_layer_cache.size(2)
-            pos = torch.arange(past_length, past_length + t, device=device)
-        else:
-            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        prefill_cache = self.transformer.h[0].attn.cache_k # k dim = (B, nh, T, hs)
+        past_length = 0 if prefill_cache is None else prefill_cache.size(2)
+        pos = torch.arange(past_length, past_length + t, device=device) # shape (t,)
+        # --------------------------------------------------------------------------------------------------------
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
@@ -354,16 +357,19 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
 
+        # KV caching logic ######################################################################################
+        # Resetting the kv cache
         if use_cache:
             self.set_kv_caching(True)
+        # -------------------------------------------------------------------------------------------------------
 
-        for _ in range(max_new_tokens):
-            # If we have a cache (and it's not the very first step), we only feed the last token
-            # We check if the cache is actually populated by looking at the first layer
-            has_cache_data = (self.transformer.h[0].attn.cache_k is not None)
+        for i in range(max_new_tokens):
 
-            if use_cache and has_cache_data:
+            # KV caching logic ######################################################################################
+            # Send only last token
+            if use_cache and i>0:
                 idx_cond = idx[:, -1:] # only the last token
+            # -------------------------------------------------------------------------------------------------------
             else:
                 # if the sequence context is longer than context size we must crop it at block_size
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
@@ -383,7 +389,10 @@ class GPT(nn.Module):
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
+        # KV caching logic ######################################################################################
+        # clear KV cache
         if use_cache:
             self.clear_kv_cache()
+        # -------------------------------------------------------------------------------------------------------
 
         return idx
