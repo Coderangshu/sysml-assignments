@@ -71,9 +71,10 @@ class CausalSelfAttention(nn.Module):
                 v = torch.cat((self.cache_v, v), dim=2)
             self.cache_k = k
             self.cache_v = v
+        T_ctx = k.size(2) # current total context size (for this pass), i.e. the length of the sequence we have seen so far
         # will be always true if caching is not enables, as all of k and v are calculated in every pass
         # if True, we are in the Prefill Phase, otherwise we are in the Generation Phase
-        is_prefill_stage = (T==k.size(2)) 
+        is_prefill_stage = (T==T_ctx) 
         # -------------------------------------------------------------------------------------------------------
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
@@ -89,7 +90,7 @@ class CausalSelfAttention(nn.Module):
             # KV caching logic ######################################################################################
             # apply mask only in prefill stage, in generation stage we want to attend to all past keys (no masking)
             if is_prefill_stage:
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = att.masked_fill(self.bias[:,:,:T,:T_ctx] == 0, float('-inf'))
             # -------------------------------------------------------------------------------------------------------
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -339,6 +340,7 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    # KV caching logic ######################################################################################
     def set_kv_caching(self, enabled: bool):
         self.clear_kv_cache()
         for block in self.transformer.h:
@@ -348,6 +350,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.cache_k = None
             block.attn.cache_v = None
+    # -------------------------------------------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
